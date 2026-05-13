@@ -7,6 +7,7 @@ import pathlib
 
 from multiprocessing.managers import SharedMemoryManager
 from ril_env.xarm_controller import XArmConfig, XArmController
+from ril_env.tactile import TactileSensors
 from ril_env.replay_buffer import ReplayBuffer
 from ril_env.realsense import SingleRealsense
 from ril_env.cv2_util import get_image_transform, optimal_row_cols
@@ -30,6 +31,8 @@ DEFAULT_OBS_KEY_MAP = {
     "JointSpeeds": "robot_joint_vel",
     # Additional keys if they exist
     "Grasp": "robot_gripper",
+    "TactileSafetyActive": "tactile_safety_active",
+    "TactileMetric": "tactile_metric",
     "robot_receive_timestamp": "robot_timestamp",
     # Camera stuff,
     "Camera_0": "camera_0",
@@ -62,6 +65,7 @@ class RealEnv:
         enable_multi_cam_vis: bool = False,
         multi_cam_vis_resolution: Tuple[int, int] = (1280, 720),
         shm_manager: Optional[SharedMemoryManager] = None,
+        tactile: Optional[TactileSensors] = None,
     ):
         logger.info("[RealEnv] Initializing environment.")
 
@@ -182,7 +186,10 @@ class RealEnv:
         robot = XArmController(
             shm_manager=shm_manager,
             xarm_config=xarm_config,
+            tactile=tactile,
         )
+        # Keep a reference so users can inspect tactile data via env.tactile.
+        self.tactile = tactile
 
         self.realsense = realsense
         self.robot = robot

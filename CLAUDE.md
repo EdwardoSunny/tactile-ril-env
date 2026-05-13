@@ -63,6 +63,15 @@ Key classes:
 ### Shared-memory primitives
 The top-level `shared_memory/` package (NOT inside `ril_env`) holds the IPC building blocks: `SharedMemoryQueue`, `SharedMemoryRingBuffer`, `SharedNDArray`. Imports use absolute paths like `from shared_memory.shared_memory_queue import SharedMemoryQueue, Empty`. When adding new processes, follow the same pattern: a queue for commands in, a ring buffer for state out, and an `mp.Event` for ready/stop signaling. All of these need a `SharedMemoryManager` from `multiprocessing.managers`, which is created at the top of every entry-point script.
 
+### Tactile safety (A31301 over serial)
+`ril_env/tactile.py` adds optional gripper safety driven by one or more A31301 tactile boards streaming `S,ts_ms,idx,addr,connected,x,y,z` lines over USB serial (see `receive_a31301_stream_no_ros.py` in `~/feng/tac_ws/...` for the upstream protocol reference).
+- `TactileSensor(mp.Process)` — one process per serial port; owns the device, publishes `(n_taxels, 3)` xyz frames + `connected` mask + timestamps to its own `SharedMemoryRingBuffer`.
+- `TactileSensors` — context-managed bundle of N `TactileSensor` workers (default 2 ports). Exposes `.ring_buffers`, `.get_latest()`, and `.safety() -> (metric, is_safe_to_close)`.
+- `TactileConfig` — selects metric (`max_abs_z` / `max_norm` / `sum_abs_z`), threshold, staleness window, and optional device-side `CMD,SET,UNITS,...` / `CMD,SET,RATE_HZ,...`.
+- Pass a `TactileSensors` instance to `XArm(..., tactile=...)`, `XArmController(..., tactile=...)`, or `RealEnv(..., tactile=...)`. The safety wrapper is **transparent**: callers still do `step(pose, grasp=1.0)`; when the metric exceeds threshold (or data is stale), the worker clamps the requested grasp to `previous_grasp` so the gripper holds position but does not close further. Opening is always allowed.
+- Per-tick `TactileSafetyActive` (0/1) and `TactileMetric` (float) are added to the `XArmController` ring-buffer state and renamed to `tactile_safety_active` / `tactile_metric` by `DEFAULT_OBS_KEY_MAP` when read via `RealEnv.get_obs()`.
+- Lifecycle: tactile workers must be running before the `XArmController` worker reads from them. The natural nested-`with` order is `SharedMemoryManager → TactileSensors → RealEnv(tactile=...)`. Stale/missing tactile is treated as unsafe (fail-safe), so if you enable tactile you must have the boards streaming.
+
 ### Other utilities
 - `ril_env/spacemouse.py` — `Spacemouse` is a `Thread` (not a `Process`) wrapping `spnav`. It applies a fixed translation/rotation transform to map the device frame into the robot frame; `get_motion_state_transformed()` returns `[dpos(3), drot(3)]` and `grasp` is updated on button press.
 - `ril_env/keystroke_counter.py` — captures keypresses for the teleop loop without blocking.

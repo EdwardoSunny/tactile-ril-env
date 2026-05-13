@@ -5,13 +5,14 @@ import scipy.spatial.transform as st
 import numpy as np
 import logging
 
-from typing import List
+from typing import List, Optional
 from xarm.wrapper import XArmAPI
 from multiprocessing.managers import SharedMemoryManager
 from shared_memory.shared_memory_queue import SharedMemoryQueue, Empty
 from shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
 from dataclasses import dataclass, field
 from ril_env.spacemouse import Spacemouse
+from ril_env.tactile import TactileConfig, TactileSensors, evaluate_safety
 
 
 logging.basicConfig(
@@ -31,7 +32,31 @@ class XArmConfig:
     home_pos: List[int] = field(default_factory=lambda: [0, 0, 0, 70, 0, 70, 0])
     home_speed: float = 50.0
     tcp_maxacc: int = 5000
+    # Gripper position bounds in xArm SDK units. grasp=0.0 -> open_pos, grasp=1.0 -> close_pos.
+    gripper_open_pos: int = 850
+    gripper_close_pos: int = 0
+    # Minimum change in grasp (in [0,1]) before re-issuing a gripper command.
+    # Prevents spamming the gripper API every tick from small numeric noise.
+    gripper_eps: float = 0.01
     verbose: bool = False  # switch off
+
+
+def _apply_grasp(arm, grasp, previous_grasp, config):
+    """Map grasp in [0,1] to a continuous gripper position and command it if changed.
+
+    Returns the new previous_grasp value (unchanged if below epsilon).
+    """
+    grasp = float(np.clip(grasp, 0.0, 1.0))
+    if abs(grasp - previous_grasp) < config.gripper_eps:
+        return previous_grasp
+    open_pos = config.gripper_open_pos
+    close_pos = config.gripper_close_pos
+    target = int(round(open_pos + grasp * (close_pos - open_pos)))
+    code = arm.set_gripper_position(target, wait=False)
+    if code != 0:
+        logger.error(f"Error in set_gripper_position({target}): {code}")
+        raise RuntimeError(f"Error in set_gripper_position({target}): {code}")
+    return grasp
 
 
 class XArm:
@@ -40,9 +65,15 @@ class XArm:
     data, please use the multiprocessing-emabled XArmController.
     """
 
-    def __init__(self, xarm_config: XArmConfig):
+    def __init__(
+        self,
+        xarm_config: XArmConfig,
+        tactile: Optional[TactileSensors] = None,
+    ):
         self.config = xarm_config
+        self.tactile = tactile
         self.init = False
+        self._safety_active = False
 
         self.current_position = None
         self.current_orientation = None
@@ -189,18 +220,24 @@ class XArm:
             logger.error(f"Error in set_servo_cartesian in step(): {code}")
             raise RuntimeError(f"Error in set_servo_cartesian in step(): {code}")
 
-        if grasp != self.previous_grasp:
-            if grasp == 1.0:
-                code = self.arm.set_gripper_position(0, wait=False)
-                if code != 0:
-                    logger.error(f"Error in set_gripper_position (close): {code}")
-                    raise RuntimeError(f"Error in set_gripper_position (close): {code}")
+        # Tactile safety: if contact exceeds threshold, don't allow closing further.
+        if self.tactile is not None:
+            metric_val, is_safe = self.tactile.safety()
+            if not is_safe and grasp > self.previous_grasp:
+                if not self._safety_active:
+                    logger.warning(
+                        f"[XArm] tactile safety engaged "
+                        f"(metric={metric_val:.2f}); clamping grasp to "
+                        f"previous_grasp={self.previous_grasp:.3f}"
+                    )
+                self._safety_active = True
+                grasp = self.previous_grasp
             else:
-                code = self.arm.set_gripper_position(850, wait=False)
-                if code != 0:
-                    logger.error(f"Error in set_gripper_position (open): {code}")
-                    raise RuntimeError(f"Error in set_gripper_position (open): {code}")
-            self.previous_grasp = grasp
+                self._safety_active = False
+
+        self.previous_grasp = _apply_grasp(
+            self.arm, grasp, self.previous_grasp, self.config
+        )
 
     def get_state(self):
         state = {}
@@ -245,9 +282,20 @@ class XArmController(mp.Process):
         self,
         shm_manager: SharedMemoryManager,
         xarm_config: XArmConfig,
+        tactile: Optional[TactileSensors] = None,
     ):
         super().__init__(name="XArmController")
 
+        # Tactile safety wiring. Only the picklable pieces are stored on self;
+        # the TactileSensors mp.Process workers are managed by the parent.
+        if tactile is not None:
+            self._tactile_ring_buffers = list(tactile.ring_buffers)
+            self._tactile_config: Optional[TactileConfig] = tactile.config
+        else:
+            self._tactile_ring_buffers = None
+            self._tactile_config = None
+
+        self.config = xarm_config
         self.robot_ip = xarm_config.robot_ip
         self.frequency = xarm_config.frequency
         self.position_gain = xarm_config.position_gain
@@ -335,6 +383,9 @@ class XArmController(mp.Process):
             # Initialize our grasp state.
             self.previous_grasp = 0.0
             state_example["Grasp"] = self.previous_grasp
+            # 0.0 / 1.0 flag set when tactile safety clamped a closing command.
+            state_example["TactileSafetyActive"] = 0.0
+            state_example["TactileMetric"] = 0.0
 
             self.ring_buffer = SharedMemoryRingBuffer.create_from_examples(
                 shm_manager=shm_manager,
@@ -393,6 +444,7 @@ class XArmController(mp.Process):
         assert self.is_alive()
         pose = np.array(pose)
         assert pose.shape == (6,)
+        grasp = float(np.clip(grasp, 0.0, 1.0))
 
         cmd = {
             "cmd": Command.STEP.value,
@@ -437,6 +489,8 @@ class XArmController(mp.Process):
 
             dt = 1.0 / self.frequency
             iter_idx = 0
+            # Edge tracker so we only log on transitions into the unsafe state.
+            safety_active_prev = False
 
             while not self.stop_event.is_set():
                 grasp = self.previous_grasp
@@ -487,27 +541,35 @@ class XArmController(mp.Process):
                     list(self.last_target_pose), is_radian=False
                 )
 
-                # Update gripper.
-                if grasp != self.previous_grasp:
-                    if grasp == 1.0:
-                        code = arm.set_gripper_position(0, wait=False)
-                        if code != 0:
-                            logger.error(
-                                f"Error in set_gripper_position (close): {code}"
-                            )
-                            raise RuntimeError(
-                                f"Error in set_gripper_position (close): {code}"
-                            )
-                    else:
-                        code = arm.set_gripper_position(850, wait=False)
-                        if code != 0:
-                            logger.error(
-                                f"Error in set_gripper_position (open): {code}"
-                            )
-                            raise RuntimeError(
-                                f"Error in set_gripper_position (open): {code}"
-                            )
-                    self.previous_grasp = grasp
+                # Tactile safety: refuse to close beyond previous_grasp if the
+                # contact metric is over threshold (or readings are stale).
+                tactile_metric = 0.0
+                safety_active = False
+                if self._tactile_ring_buffers is not None and self._tactile_config is not None:
+                    try:
+                        tactile_states = [rb.get() for rb in self._tactile_ring_buffers]
+                        tactile_metric, is_safe = evaluate_safety(
+                            tactile_states, self._tactile_config
+                        )
+                    except Exception as e:
+                        logger.error(f"[XArmController] tactile read failed: {e}")
+                        is_safe = False
+                    if not is_safe and grasp > self.previous_grasp:
+                        grasp = self.previous_grasp
+                        safety_active = True
+                if safety_active and not safety_active_prev:
+                    logger.warning(
+                        f"[XArmController] tactile safety engaged "
+                        f"(metric={tactile_metric:.2f}, "
+                        f"threshold={self._tactile_config.safety_threshold:.2f}); "
+                        f"holding grasp at {self.previous_grasp:.3f}"
+                    )
+                safety_active_prev = safety_active
+
+                # Update gripper (continuous mapping; epsilon-gated).
+                self.previous_grasp = _apply_grasp(
+                    arm, grasp, self.previous_grasp, self.config
+                )
 
                 if code != 0:
                     logger.error(f"[XArmController] set_servo_cartesian error: {code}")
@@ -547,6 +609,8 @@ class XArmController(mp.Process):
                     state["JointSpeeds"] = np.zeros(7, dtype=np.float64)
 
                 state["Grasp"] = self.previous_grasp
+                state["TactileSafetyActive"] = 1.0 if safety_active else 0.0
+                state["TactileMetric"] = float(tactile_metric)
                 state["robot_receive_timestamp"] = time.time() - start_time
 
                 # Update ring buffer (data)
